@@ -90,18 +90,25 @@ class InvertedIndex:
     def add(self, entity_id, tokens):
         """Add an entity's tokens to the index."""
         for token in tokens:
-            if token in self._capped_tokens:
-                continue
-            posting = self.index[token]
-            posting.add(entity_id)
+            self.index[token].add(entity_id)
+            
+    def apply_cap(self):
+        """Apply max_postings globally, deleting overly common tokens."""
+        to_delete = []
+        for token, posting in self.index.items():
             if len(posting) > self.max_postings:
-                # Too common — drop the entire posting list
+                to_delete.append(token)
                 self._capped_tokens.add(token)
-                del self.index[token]
+        for token in to_delete:
+            del self.index[token]
     
-    def lookup(self, tokens):
+    def lookup(self, tokens, restrict_to_eids=None):
         """Find all entity_ids sharing any token, with overlap counts.
         
+        Args:
+            tokens: set of tokens to lookup
+            restrict_to_eids: if provided, only these entity_ids are counted.
+            
         Returns:
             Counter mapping entity_id -> number of shared tokens
         """
@@ -110,8 +117,15 @@ class InvertedIndex:
             if token in self._capped_tokens:
                 continue
             if token in self.index:
-                for eid in self.index[token]:
-                    hits[eid] += 1
+                posting = self.index[token]
+                if restrict_to_eids is not None:
+                    # Fast C-level set intersection avoids massive Python loops
+                    valid_eids = posting.intersection(restrict_to_eids)
+                    for eid in valid_eids:
+                        hits[eid] += 1
+                else:
+                    for eid in posting:
+                        hits[eid] += 1
         return hits
     
     def stats(self):
@@ -142,9 +156,9 @@ def build_indexes_from_file(filepath, country_filter=None):
     Returns:
         (name_index, addr_index, postal_index, entity_count)
     """
-    name_idx = InvertedIndex()
-    addr_idx = InvertedIndex()
-    postal_idx = InvertedIndex(max_postings=50_000)  # postal codes are less granular
+    name_idx = InvertedIndex(max_postings=float('inf'))
+    addr_idx = InvertedIndex(max_postings=float('inf'))
+    postal_idx = InvertedIndex(max_postings=float('inf'))  # postal codes are less granular
     entity_count = 0
     
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -206,7 +220,7 @@ def derive_source(entity_id):
 
 def generate_candidates_for_country(
     s1_filepath, cand_filepaths, country, output_file,
-    max_candidates=None, append=False
+    max_candidates=None, append=False, gt_map=None
 ):
     """Generate candidate pairs for one country partition.
     
@@ -250,16 +264,10 @@ def generate_candidates_for_country(
         total_cands += n_ents
         print(f"    Loaded {n_ents:,} candidates from {cpath.name}")
     
-    # CRITICAL: Enforce max_postings on the completely merged indexes
-    # Otherwise common tokens appearing in multiple candidate sources will blow past the cap
-    for idx_obj in [name_idx, addr_idx, postal_idx]:
-        to_delete = []
-        for token, posting in idx_obj.index.items():
-            if len(posting) > idx_obj.max_postings:
-                to_delete.append(token)
-                idx_obj._capped_tokens.add(token)
-        for token in to_delete:
-            del idx_obj.index[token]
+    # CRITICAL: Apply max_postings cap globally AFTER merging all candidates
+    name_idx.apply_cap()
+    addr_idx.apply_cap()
+    postal_idx.apply_cap()
             
     t_index = time.time() - t0
     
@@ -281,6 +289,9 @@ def generate_candidates_for_country(
     s1_count = 0
     total_pairs = 0
     candidates_per_s1 = []
+    pre_topk_found = 0
+    post_topk_found = 0
+    gt_pairs_in_country = 0
     
     with open(s1_filepath, 'r', encoding='utf-8') as fin, \
          open(output_file, mode, encoding='utf-8') as fout:
@@ -307,6 +318,10 @@ def generate_candidates_for_country(
             
             s1_id = parts[eid_i].strip()
             s1_count += 1
+            
+            true_cids = gt_map.get(s1_id, set()) if gt_map else set()
+            if true_cids:
+                gt_pairs_in_country += len(true_cids)
             
             # Channel 1: Name token overlap
             s1_name_tokens = set()
@@ -335,24 +350,34 @@ def generate_candidates_for_country(
                 candidates_per_s1.append(0)
                 continue
             
-            # Score each candidate: name_overlap + addr_overlap + postal_bonus
+            # Score each candidate
             scored = []
             for cid in all_cand_ids:
                 n_ov = name_hits.get(cid, 0)
+                a_ov = addr_hits.get(cid, 0)
                 p_match = 1 if cid in postal_hits else 0
                 
-                # ENFORCE MINIMUM OVERLAP: Drop candidates that only match on address words
-                if n_ov < config.BLOCKING_MIN_NAME_OVERLAP and p_match == 0:
+                # ENFORCE MINIMUM OVERLAP: Must have some name/postal match OR a very strong address match
+                if n_ov < config.BLOCKING_MIN_NAME_OVERLAP and p_match == 0 and a_ov < 2:
                     continue
                     
-                a_ov = addr_hits.get(cid, 0)
                 # Combined score: name overlap weighted higher
                 score = n_ov * 3 + a_ov * 2 + p_match * 5
                 scored.append((cid, n_ov, a_ov, p_match, score))
+                
+            if true_cids:
+                for cid in true_cids:
+                    if any(c == cid for c, _, _, _, _ in scored):
+                        pre_topk_found += 1
             
             # Sort by score descending, take top-K
             scored.sort(key=lambda x: -x[4])
             top = scored[:max_candidates]
+            
+            if true_cids:
+                for cid in true_cids:
+                    if any(c == cid for c, _, _, _, _ in top):
+                        post_topk_found += 1
             
             candidates_per_s1.append(len(top))
             
@@ -388,6 +413,9 @@ def generate_candidates_for_country(
         'zero_candidate_s1': zero_cands,
         'index_time': t_index,
         'gen_time': t_gen,
+        'pre_topk_found': pre_topk_found,
+        'post_topk_found': post_topk_found,
+        'gt_pairs': gt_pairs_in_country,
     }
     
     print(f"  [{country}] Done in {t_gen:.1f}s")
@@ -543,6 +571,10 @@ def run_blocking(mode='train'):
         print(f"  ERROR: {s1_path} not found. Run normalization first.")
         return
     
+    gt_map = None
+    if mode == 'train' and config.TRAIN_GT.exists():
+        _, gt_map = load_ground_truth(config.TRAIN_GT)
+        
     all_stats = []
     for i, country in enumerate(countries):
         stats = generate_candidates_for_country(
@@ -551,6 +583,7 @@ def run_blocking(mode='train'):
             country=country,
             output_file=output_path,
             append=(i > 0),  # first country writes header, rest append
+            gt_map=gt_map,
         )
         all_stats.append(stats)
     
@@ -561,6 +594,19 @@ def run_blocking(mode='train'):
     print(f"    Total S1 entities: {total_s1:,}")
     print(f"    Total candidate pairs: {total_pairs:,}")
     print(f"    Output: {output_path}")
+    
+    if mode == 'train' and gt_map:
+        total_gt = sum(s['gt_pairs'] for s in all_stats)
+        pre_found = sum(s['pre_topk_found'] for s in all_stats)
+        post_found = sum(s['post_topk_found'] for s in all_stats)
+        
+        pre_recall = pre_found / max(total_gt, 1)
+        post_recall = post_found / max(total_gt, 1)
+        
+        print("\n  RECALL DIAGNOSTICS:")
+        print(f"    Total true pairs:    {total_gt:,}")
+        print(f"    Recall BEFORE top-K: {pre_found:,} ({pre_recall*100:.2f}%)")
+        print(f"    Recall AFTER top-K:  {post_found:,} ({post_recall*100:.2f}%)")
     
     # Blocking recall check (train mode only)
     if mode == 'train' and config.TRAIN_GT.exists():
