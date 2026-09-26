@@ -89,8 +89,8 @@ def clean_dataframe(df):
     df = df.drop_duplicates(subset=[config.COL_ENTITY_ID], keep='first')
     n_dupes = n_before_dedup - len(df)
     
-    # 7. Standardize country names
-    df[config.COL_COUNTRY] = df[config.COL_COUNTRY].str.strip()
+    # 7. Standardize country names (trim, title-case)
+    df[config.COL_COUNTRY] = df[config.COL_COUNTRY].str.strip().str.title()
     
     n_after = len(df)
     

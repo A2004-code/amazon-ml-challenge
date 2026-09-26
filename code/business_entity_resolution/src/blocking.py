@@ -28,6 +28,19 @@ from . import config
 # TOKENIZATION
 # ═══════════════════════════════════════════════════════════════════
 
+def discover_countries(s1_filepath):
+    """Discover all countries present in the S1 dataset dynamically."""
+    countries = set()
+    with open(s1_filepath, 'r', encoding='utf-8') as f:
+        header = f.readline().strip().split('\t')
+        country_i = {c: i for i, c in enumerate(header)}['country']
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            if country_i < len(parts):
+                countries.add(parts[country_i].strip())
+    return sorted(countries)
+
+
 def tokenize(text, min_len=None):
     """Split text into lowercase tokens, filtering stopwords and short tokens.
     
@@ -425,31 +438,25 @@ def measure_blocking_recall(candidate_pairs_path, gt_path):
     gt_pairs, gt_map = load_ground_truth(gt_path)
     print(f"  Ground truth: {len(gt_map):,} S1 entities, {len(gt_pairs):,} true pairs")
     
-    # Load blocked candidate pairs
-    print(f"  Loading candidate pairs from {candidate_pairs_path.name}...")
-    blocked_pairs = set()
+    # Stream candidate pairs to avoid OOM
+    print(f"  Streaming candidate pairs from {candidate_pairs_path.name}...")
+    found = set()
+    total_blocked = 0
     with open(candidate_pairs_path, 'r', encoding='utf-8') as f:
         f.readline()  # skip header
         for line in f:
             parts = line.strip().split('\t')
             if len(parts) >= 2:
-                blocked_pairs.add((parts[0].strip(), parts[1].strip()))
+                total_blocked += 1
+                pair = (parts[0].strip(), parts[1].strip())
+                if pair in gt_pairs:
+                    found.add(pair)
     
-    print(f"  Blocked pairs: {len(blocked_pairs):,}")
+    print(f"  Blocked pairs (streamed): {total_blocked:,}")
     
     # Compute recall
-    found = gt_pairs & blocked_pairs
-    missed = gt_pairs - blocked_pairs
-    
+    missed = gt_pairs - found
     recall = len(found) / len(gt_pairs) if gt_pairs else 0.0
-    
-    # Per-country breakdown
-    country_stats = defaultdict(lambda: {'found': 0, 'total': 0})
-    for s1_id, cid in gt_pairs:
-        # Infer country from the candidate pairs file or just count
-        country_stats['all']['total'] += 1
-        if (s1_id, cid) in found:
-            country_stats['all']['found'] += 1
     
     elapsed = time.time() - t0
     
@@ -506,7 +513,7 @@ def run_blocking(mode='train'):
             norm_dir / "train_source3_norm.tsv",
         ]
         output_path = block_dir / "train_candidate_pairs.tsv"
-        countries = ['US', 'India']
+        countries = discover_countries(s1_path)
     else:
         s1_path = norm_dir / "test_source1_norm.tsv"
         cand_paths = [
@@ -514,7 +521,7 @@ def run_blocking(mode='train'):
             norm_dir / "test_source3_norm.tsv",
         ]
         output_path = block_dir / "test_candidate_pairs.tsv"
-        countries = ['US', 'India', 'France']
+        countries = discover_countries(s1_path)
     
     if not s1_path.exists():
         print(f"  ERROR: {s1_path} not found. Run normalization first.")

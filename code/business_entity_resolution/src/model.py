@@ -227,12 +227,33 @@ def train_lightgbm(train_df, val_df, feature_cols):
 # THRESHOLD TUNING (F0.5)
 # ═══════════════════════════════════════════════════════════════════
 
-def fbeta_at_threshold(y_true, y_prob, threshold, beta=0.5):
-    """Compute F-beta score at a given probability threshold."""
-    y_pred = (y_prob >= threshold).astype(int)
-    if y_pred.sum() == 0:
-        return 0.0
-    return fbeta_score(y_true, y_pred, beta=beta, zero_division=0)
+def per_entity_f05(val_df, y_pred, beta=0.5):
+    """Macro-average F_beta computed per S1 entity, matching the challenge metric exactly."""
+    val = val_df.copy()
+    val['pred'] = y_pred
+
+    scores = []
+    for s1_id, group in val.groupby('s1_entity_id'):
+        true_pos_ids = set(group.loc[group['label'] == 1, 'cand_entity_id'])
+        pred_pos_ids = set(group.loc[group['pred'] == 1, 'cand_entity_id'])
+
+        if not true_pos_ids and not pred_pos_ids:
+            scores.append(1.0)   # correct singleton
+            continue
+        if not pred_pos_ids:
+            scores.append(0.0)   # missed everything
+            continue
+
+        tp = len(true_pos_ids & pred_pos_ids)
+        precision = tp / len(pred_pos_ids)
+        recall = tp / len(true_pos_ids) if true_pos_ids else 0.0
+        if precision == 0 and recall == 0:
+            scores.append(0.0)
+            continue
+        f = (1 + beta**2) * precision * recall / (beta**2 * precision + recall) if (precision or recall) else 0.0
+        scores.append(f)
+
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def tune_threshold(model, val_df, feature_cols, beta=0.5):
@@ -275,7 +296,7 @@ def tune_threshold(model, val_df, feature_cols, beta=0.5):
         
         prec = precision_score(y_val, y_pred, zero_division=0)
         rec = recall_score(y_val, y_pred, zero_division=0)
-        fb = fbeta_score(y_val, y_pred, beta=beta, zero_division=0)
+        fb = per_entity_f05(val_df, y_pred, beta=beta)
         
         results.append({
             'threshold': round(t, 3),
@@ -411,43 +432,40 @@ def predict(model, df, feature_cols, threshold):
     return df
 
 
-def generate_submission(pred_df, output_dir):
-    """Generate submission files from prediction results.
-    
-    Writes:
-      - matching_results.tsv:  s1_entity_id -> comma-separated matched IDs
-      - candidate_pairs.tsv:   all candidate pairs considered
-    
-    Args:
-        pred_df: DataFrame with predictions (match_pred, s1_entity_id, cand_entity_id)
-        output_dir: directory to write output files
+def generate_submission(pred_df, all_test_s1_ids, output_dir):
+    """
+    all_test_s1_ids: the FULL set of S1 entity_ids from test_source1.tsv —
+    not just ones that appear in pred_df — so singletons and zero-candidate
+    entities still get a row.
     """
     os.makedirs(output_dir, exist_ok=True)
-    
-    # matching_results.tsv: only matched pairs, grouped by S1 entity
+
     matches = pred_df[pred_df['match_pred'] == 1]
-    
     match_groups = defaultdict(list)
     for _, row in matches.iterrows():
         match_groups[row['s1_entity_id']].append(row['cand_entity_id'])
-    
+
     results_path = output_dir / "matching_results.tsv"
     with open(results_path, 'w', encoding='utf-8') as f:
-        f.write("s1_entity_id\tmatched_entity_ids\n")
-        for s1_id in sorted(match_groups.keys()):
-            matched = ','.join(match_groups[s1_id])
+        f.write("source1_entity_id\tmatched_entity_ids\n")
+        for s1_id in sorted(all_test_s1_ids):
+            matched = ','.join(sorted(set(match_groups.get(s1_id, []))))
             f.write(f"{s1_id}\t{matched}\n")
-    
-    print(f"  matching_results.tsv: {len(match_groups):,} S1 entities with matches")
-    
-    # candidate_pairs.tsv: all candidate pairs with scores
+    print(f"  matching_results.tsv: {len(all_test_s1_ids):,} rows "
+          f"({len(match_groups):,} with matches)")
+
+    # candidate_pairs.tsv - SAME shape: one row per S1, comma-joined candidates
+    cand_groups = defaultdict(list)
+    for _, row in pred_df.iterrows():
+        cand_groups[row['s1_entity_id']].append(row['cand_entity_id'])
+
     cand_path = output_dir / "candidate_pairs.tsv"
-    cand_cols = ['s1_entity_id', 'cand_entity_id', 'cand_source', 'country', 'match_prob', 'match_pred']
-    available_cols = [c for c in cand_cols if c in pred_df.columns]
-    pred_df[available_cols].to_csv(cand_path, sep='\t', index=False, encoding='utf-8')
-    
-    print(f"  candidate_pairs.tsv: {len(pred_df):,} total pairs")
-    print(f"  Output directory: {output_dir}")
+    with open(cand_path, 'w', encoding='utf-8') as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for s1_id in sorted(all_test_s1_ids):
+            cands = ','.join(sorted(set(cand_groups.get(s1_id, []))))
+            f.write(f"{s1_id}\t{cands}\n")
+    print(f"  candidate_pairs.tsv: {len(all_test_s1_ids):,} rows")
 
 
 # ═══════════════════════════════════════════════════════════════════

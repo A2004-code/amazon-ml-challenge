@@ -213,13 +213,23 @@ def run_test_pipeline(skip_existing=True):
     
     # ── Stage 7: Generate submission ──────────────────────────────
     print("\n[7/7] GENERATING SUBMISSION FILES")
-    generate_submission(pred_df, config.OUTPUT_DIR)
     
-    # Also copy candidate_pairs to output/
-    import shutil
-    if test_pairs.exists():
-        shutil.copy2(test_pairs, config.OUTPUT_DIR / "candidate_pairs.tsv")
-        print(f"  Copied blocking candidate_pairs.tsv to output/")
+    # Extract ALL S1 entity IDs from test_source1_clean.tsv (or norm)
+    # so singletons get a row as required by the contest.
+    s1_test_path = norm_dir / "test_source1_norm.tsv"
+    if not s1_test_path.exists():
+        s1_test_path = clean_dir / "test_source1_clean.tsv"
+        
+    all_test_s1_ids = []
+    with open(s1_test_path, 'r', encoding='utf-8') as f:
+        header = f.readline().strip().split('\t')
+        idx = header.index('entity_id')
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) > idx:
+                all_test_s1_ids.append(parts[idx].strip())
+                
+    generate_submission(pred_df, set(all_test_s1_ids), config.OUTPUT_DIR)
     
     elapsed = time.time() - t0
     print("\n" + "=" * 70)
