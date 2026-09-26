@@ -330,12 +330,6 @@ def generate_candidates_for_country(
                 s1_name_tokens = tokenize(parts[norm_name_i])
             name_hits = name_idx.lookup(s1_name_tokens)
             
-            # Channel 2: Address token overlap
-            s1_addr_tokens = set()
-            if norm_addr_i is not None and norm_addr_i < len(parts):
-                s1_addr_tokens = tokenize(parts[norm_addr_i])
-            addr_hits = addr_idx.lookup(s1_addr_tokens)
-            
             # Channel 3: Postal code exact match
             s1_postal = ''
             if postal_i is not None and postal_i < len(parts):
@@ -344,16 +338,25 @@ def generate_candidates_for_country(
             if s1_postal and s1_postal in postal_idx.index:
                 postal_hits = postal_idx.index[s1_postal]
             
-            # Union all candidate IDs across channels
-            all_cand_ids = set(name_hits.keys()) | set(addr_hits.keys()) | postal_hits
-            
-            if not all_cand_ids:
+            # Fast-path: must have name OR postal match to proceed.
+            # Pure address-only matches are rare true positives but cause a
+            # catastrophic O(S1 * posting_size) scan on 30M-posting India index.
+            base_cands = set(name_hits.keys()) | postal_hits
+            if not base_cands:
                 candidates_per_s1.append(0)
                 continue
             
-            # Score each candidate
+            # Channel 2: Address overlap — restricted to base_cands only.
+            # This uses C-level set.intersection(), avoiding Python-level loops
+            # over the full 30M-posting address index.
+            s1_addr_tokens = set()
+            if norm_addr_i is not None and norm_addr_i < len(parts):
+                s1_addr_tokens = tokenize(parts[norm_addr_i])
+            addr_hits = addr_idx.lookup(s1_addr_tokens, restrict_to_eids=base_cands)
+            
+            # Score each candidate (all must have name or postal hit)
             scored = []
-            for cid in all_cand_ids:
+            for cid in base_cands:
                 n_ov = name_hits.get(cid, 0)
                 a_ov = addr_hits.get(cid, 0)
                 p_match = 1 if cid in postal_hits else 0
