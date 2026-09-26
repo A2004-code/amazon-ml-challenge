@@ -250,6 +250,17 @@ def generate_candidates_for_country(
         total_cands += n_ents
         print(f"    Loaded {n_ents:,} candidates from {cpath.name}")
     
+    # CRITICAL: Enforce max_postings on the completely merged indexes
+    # Otherwise common tokens appearing in multiple candidate sources will blow past the cap
+    for idx_obj in [name_idx, addr_idx, postal_idx]:
+        to_delete = []
+        for token, posting in idx_obj.index.items():
+            if len(posting) > idx_obj.max_postings:
+                to_delete.append(token)
+                idx_obj._capped_tokens.add(token)
+        for token in to_delete:
+            del idx_obj.index[token]
+            
     t_index = time.time() - t0
     
     name_stats = name_idx.stats()
@@ -328,8 +339,13 @@ def generate_candidates_for_country(
             scored = []
             for cid in all_cand_ids:
                 n_ov = name_hits.get(cid, 0)
-                a_ov = addr_hits.get(cid, 0)
                 p_match = 1 if cid in postal_hits else 0
+                
+                # ENFORCE MINIMUM OVERLAP: Drop candidates that only match on address words
+                if n_ov < config.BLOCKING_MIN_NAME_OVERLAP and p_match == 0:
+                    continue
+                    
+                a_ov = addr_hits.get(cid, 0)
                 # Combined score: name overlap weighted higher
                 score = n_ov * 3 + a_ov * 2 + p_match * 5
                 scored.append((cid, n_ov, a_ov, p_match, score))
