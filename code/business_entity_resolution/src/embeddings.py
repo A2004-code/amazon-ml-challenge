@@ -318,15 +318,29 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     zero_emb = np.zeros(config.E5_EMBEDDING_DIM, dtype=np.float32)
     
     for chunk in reader:
-        # Batch index lookup — one list comprehension, no Python loop per row
-        s1_indices  = [s1_id_to_idx.get(eid, -1) for eid in chunk['s1_entity_id']]
-        cand_indices = [cand_id_to_idx.get(eid, -1) for eid in chunk['cand_entity_id']]
+        # Convert indices to numpy arrays for fast bulk indexing
+        s1_indices = np.array([s1_id_to_idx.get(eid, -1) for eid in chunk['s1_entity_id']])
+        cand_indices = np.array([cand_id_to_idx.get(eid, -1) for eid in chunk['cand_entity_id']])
+        
+        valid_s1 = s1_indices >= 0
+        valid_cand = cand_indices >= 0
 
-        # Build embedding matrices for this chunk (zero-row for any missing ID)
-        s1_name_mat   = np.array([s1_name_emb[i]   if i >= 0 else zero_emb for i in s1_indices])
-        cand_name_mat = np.array([cand_name_emb[i]  if i >= 0 else zero_emb for i in cand_indices])
-        s1_addr_mat   = np.array([s1_addr_emb[i]    if i >= 0 else zero_emb for i in s1_indices])
-        cand_addr_mat = np.array([cand_addr_emb[i]  if i >= 0 else zero_emb for i in cand_indices])
+        # Build embedding matrices via vectorized C-level memmap lookups
+        s1_name_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        if valid_s1.any():
+            s1_name_mat[valid_s1] = s1_name_emb[s1_indices[valid_s1]]
+            
+        cand_name_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        if valid_cand.any():
+            cand_name_mat[valid_cand] = cand_name_emb[cand_indices[valid_cand]]
+            
+        s1_addr_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        if valid_s1.any():
+            s1_addr_mat[valid_s1] = s1_addr_emb[s1_indices[valid_s1]]
+            
+        cand_addr_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        if valid_cand.any():
+            cand_addr_mat[valid_cand] = cand_addr_emb[cand_indices[valid_cand]]
 
         # Element-wise multiply then sum across embedding dim — one numpy op per similarity
         chunk['e5_name_cosine'] = (s1_name_mat * cand_name_mat).sum(axis=1)
