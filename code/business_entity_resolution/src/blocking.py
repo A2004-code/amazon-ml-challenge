@@ -242,10 +242,13 @@ def generate_candidates_for_country(
     t0 = time.time()
     
     # Build indexes from all candidate files (S2 + S3)
-    # Use inf so NO token gets dropped during merge — apply_cap() does global cap after.
+    # Use inf so NO token gets dropped during the merge — apply_cap() does the
+    # global cap after all files are merged. Postal codes have a much higher cap
+    # than name/address tokens because a postal code appearing in 50k candidates
+    # is still useful as a blocking signal, unlike a common word like 'street'.
     name_idx = InvertedIndex(max_postings=float('inf'))
     addr_idx = InvertedIndex(max_postings=float('inf'))
-    postal_idx = InvertedIndex(max_postings=float('inf'))
+    postal_idx = InvertedIndex(max_postings=float('inf'))  # cap applied later via apply_cap()
     total_cands = 0
     
     for cpath in cand_filepaths:
@@ -265,10 +268,14 @@ def generate_candidates_for_country(
         total_cands += n_ents
         print(f"    Loaded {n_ents:,} candidates from {cpath.name}")
     
-    # CRITICAL: Apply max_postings cap globally AFTER merging all candidates
-    name_idx.apply_cap()
-    addr_idx.apply_cap()
-    postal_idx.apply_cap()
+    # CRITICAL: Apply max_postings cap globally AFTER merging all candidates.
+    # Postal codes use a higher cap than name/address tokens because a postal
+    # code appearing in 50k candidates is still structurally discriminative,
+    # while a word like 'road' in 50k candidates is noise.
+    name_idx.apply_cap()  # uses config.BLOCKING_MAX_POSTINGS (default 5000)
+    addr_idx.apply_cap()  # uses config.BLOCKING_MAX_POSTINGS (default 5000)
+    postal_idx.max_postings = 50_000  # override before capping
+    postal_idx.apply_cap()  # higher cap for postal codes
             
     t_index = time.time() - t0
     
@@ -324,13 +331,13 @@ def generate_candidates_for_country(
             if true_cids:
                 gt_pairs_in_country += len(true_cids)
             
-            # Channel 1: Name token overlap
+            # Channel 1: Name token overlap (blocking channel)
             s1_name_tokens = set()
             if norm_name_i is not None and norm_name_i < len(parts):
                 s1_name_tokens = tokenize(parts[norm_name_i])
             name_hits = name_idx.lookup(s1_name_tokens)
             
-            # Channel 3: Postal code exact match
+            # Channel 2: Postal code exact match (blocking channel)
             s1_postal = ''
             if postal_i is not None and postal_i < len(parts):
                 s1_postal = parts[postal_i].strip()
@@ -338,16 +345,21 @@ def generate_candidates_for_country(
             if s1_postal and s1_postal in postal_idx.index:
                 postal_hits = postal_idx.index[s1_postal]
             
-            # Fast-path: must have name OR postal match to proceed.
-            # Pure address-only matches are rare true positives but cause a
-            # catastrophic O(S1 * posting_size) scan on 30M-posting India index.
+            # Gating: candidate must enter via NAME or POSTAL.
+            # Address is not an independent blocking channel here — it is
+            # computed as a FEATURE only for the candidates already retrieved.
+            # Rationale: the India address index has 30M postings; a full
+            # unrestricted scan for every S1 entity causes catastrophic slowdown.
+            # Pure address-only true pairs (name changed, postal missing) are
+            # very rare; the ground-truth recall diagnostics below will flag
+            # if this gating is causing significant recall loss.
             base_cands = set(name_hits.keys()) | postal_hits
             if not base_cands:
                 candidates_per_s1.append(0)
                 continue
             
-            # Channel 2: Address overlap — restricted to base_cands only.
-            # This uses C-level set.intersection(), avoiding Python-level loops
+            # Channel 3: Address overlap — scoring feature, restricted to base_cands.
+            # Uses C-level set.intersection(), avoiding Python-level loops
             # over the full 30M-posting address index.
             s1_addr_tokens = set()
             if norm_addr_i is not None and norm_addr_i < len(parts):
@@ -609,8 +621,9 @@ def run_blocking(mode='train'):
         
         print("\n  RECALL DIAGNOSTICS:")
         print(f"    Total true pairs:    {total_gt:,}")
-        print(f"    Recall BEFORE top-K: {pre_found:,} ({pre_recall*100:.2f}%)")
-        print(f"    Recall AFTER top-K:  {post_found:,} ({post_recall*100:.2f}%)")
+        print(f"    Recall BEFORE TOP-K  (after name/postal gating): {pre_found:,} ({pre_recall*100:.2f}%)")
+        print(f"    Recall AFTER TOP-K   (final output recall):       {post_found:,} ({post_recall*100:.2f}%)")
+        print(f"    Note: 'before top-K' excludes address-only true pairs (name+postal gating applied)")
     
     # Blocking recall check (train mode only)
     if mode == 'train' and config.TRAIN_GT.exists():
