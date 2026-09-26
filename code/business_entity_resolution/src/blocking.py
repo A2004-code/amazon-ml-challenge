@@ -1,0 +1,552 @@
+"""Stage 4-5: Blocking — candidate pair generation and recall check.
+
+Generates candidate pairs using 3 channels (unioned per S1 entity):
+  1. Name-token inverted index  — shared word tokens in norm_name
+  2. Address-token inverted index — shared word tokens in norm_address
+  3. Postal-code exact match — same extracted postal/ZIP/PIN code
+
+All channels are scoped by country. Common tokens are skipped
+(via stopwords + max_postings cap) to avoid quadratic blowup.
+
+The blocking recall checkpoint measures what fraction of ground-truth
+true pairs survived blocking — this is the gate that decides whether
+E5 retrieval is needed as a 4th channel.
+
+Usage:
+    python -m src.blocking
+"""
+import os
+import re
+import time
+from collections import defaultdict, Counter
+from pathlib import Path
+
+from . import config
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TOKENIZATION
+# ═══════════════════════════════════════════════════════════════════
+
+def tokenize(text, min_len=None):
+    """Split text into lowercase tokens, filtering stopwords and short tokens.
+    
+    Args:
+        text: input string (should already be normalized)
+        min_len: minimum token length (default: config.BLOCKING_MIN_TOKEN_LEN)
+    
+    Returns:
+        set of unique tokens
+    """
+    if min_len is None:
+        min_len = config.BLOCKING_MIN_TOKEN_LEN
+    
+    if not isinstance(text, str) or not text.strip():
+        return set()
+    
+    # Split on whitespace and punctuation
+    raw_tokens = re.split(r'[\s,/\-\.]+', text.lower())
+    
+    tokens = set()
+    for t in raw_tokens:
+        t = t.strip("'\"();:")
+        if len(t) < min_len:
+            continue
+        if t in config.BLOCKING_STOPWORDS:
+            continue
+        tokens.add(t)
+    
+    return tokens
+
+
+# ═══════════════════════════════════════════════════════════════════
+# INVERTED INDEX
+# ═══════════════════════════════════════════════════════════════════
+
+class InvertedIndex:
+    """Memory-efficient inverted index: token -> set of entity_ids.
+    
+    Supports max_postings cap to skip over-common tokens during lookup.
+    """
+    
+    def __init__(self, max_postings=None):
+        self.index = defaultdict(set)
+        self.max_postings = max_postings or config.BLOCKING_MAX_POSTINGS
+        self._capped_tokens = set()  # tokens that exceeded max_postings
+    
+    def add(self, entity_id, tokens):
+        """Add an entity's tokens to the index."""
+        for token in tokens:
+            if token in self._capped_tokens:
+                continue
+            posting = self.index[token]
+            posting.add(entity_id)
+            if len(posting) > self.max_postings:
+                # Too common — drop the entire posting list
+                self._capped_tokens.add(token)
+                del self.index[token]
+    
+    def lookup(self, tokens):
+        """Find all entity_ids sharing any token, with overlap counts.
+        
+        Returns:
+            Counter mapping entity_id -> number of shared tokens
+        """
+        hits = Counter()
+        for token in tokens:
+            if token in self._capped_tokens:
+                continue
+            if token in self.index:
+                for eid in self.index[token]:
+                    hits[eid] += 1
+        return hits
+    
+    def stats(self):
+        """Return index statistics."""
+        posting_sizes = [len(v) for v in self.index.values()]
+        return {
+            'unique_tokens': len(self.index),
+            'capped_tokens': len(self._capped_tokens),
+            'total_postings': sum(posting_sizes),
+            'avg_posting_size': sum(posting_sizes) / max(len(posting_sizes), 1),
+            'max_posting_size': max(posting_sizes) if posting_sizes else 0,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# INDEX BUILDING
+# ═══════════════════════════════════════════════════════════════════
+
+def build_indexes_from_file(filepath, country_filter=None):
+    """Build name, address, and postal inverted indexes from a normalized TSV.
+    
+    Reads line-by-line for memory efficiency.
+    
+    Args:
+        filepath: path to normalized TSV
+        country_filter: if set, only include records from this country
+    
+    Returns:
+        (name_index, addr_index, postal_index, entity_count)
+    """
+    name_idx = InvertedIndex()
+    addr_idx = InvertedIndex()
+    postal_idx = InvertedIndex(max_postings=50_000)  # postal codes are less granular
+    entity_count = 0
+    
+    with open(filepath, 'r', encoding='utf-8') as f:
+        header = f.readline().strip().split('\t')
+        col_map = {col: i for i, col in enumerate(header)}
+        
+        eid_i = col_map['entity_id']
+        country_i = col_map['country']
+        norm_name_i = col_map.get('norm_name')
+        norm_addr_i = col_map.get('norm_address')
+        postal_i = col_map.get('postal_code')
+        
+        if norm_name_i is None:
+            raise ValueError(f"Column 'norm_name' not found in {filepath}. Run normalization first.")
+        
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) <= max(eid_i, country_i):
+                continue
+            
+            # Country filter
+            if country_filter and parts[country_i].strip() != country_filter:
+                continue
+            
+            eid = parts[eid_i].strip()
+            entity_count += 1
+            
+            # Name tokens
+            if norm_name_i is not None and norm_name_i < len(parts):
+                name_tokens = tokenize(parts[norm_name_i])
+                name_idx.add(eid, name_tokens)
+            
+            # Address tokens
+            if norm_addr_i is not None and norm_addr_i < len(parts):
+                addr_tokens = tokenize(parts[norm_addr_i])
+                addr_idx.add(eid, addr_tokens)
+            
+            # Postal code (exact match channel)
+            if postal_i is not None and postal_i < len(parts):
+                pc = parts[postal_i].strip()
+                if pc:
+                    postal_idx.add(eid, {pc})
+    
+    return name_idx, addr_idx, postal_idx, entity_count
+
+
+def derive_source(entity_id):
+    """Derive source (s2/s3) from entity_id prefix."""
+    if entity_id.startswith('S2-') or entity_id.startswith('s2-'):
+        return 's2'
+    elif entity_id.startswith('S3-') or entity_id.startswith('s3-'):
+        return 's3'
+    return 'unknown'
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CANDIDATE GENERATION
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_candidates_for_country(
+    s1_filepath, cand_filepaths, country, output_file,
+    max_candidates=None, append=False
+):
+    """Generate candidate pairs for one country partition.
+    
+    Args:
+        s1_filepath: path to normalized S1 TSV
+        cand_filepaths: list of paths to normalized S2/S3 TSVs
+        country: country string to filter on
+        output_file: path to write candidate pairs TSV
+        max_candidates: max candidates per S1 entity
+        append: if True, append to output_file
+    
+    Returns:
+        dict with statistics
+    """
+    if max_candidates is None:
+        max_candidates = config.BLOCKING_MAX_CANDIDATES
+    
+    print(f"\n  [{country}] Building candidate inverted indexes...")
+    t0 = time.time()
+    
+    # Build indexes from all candidate files (S2 + S3)
+    name_idx = InvertedIndex()
+    addr_idx = InvertedIndex()
+    postal_idx = InvertedIndex(max_postings=50_000)
+    total_cands = 0
+    
+    for cpath in cand_filepaths:
+        if not cpath.exists():
+            print(f"  WARNING: {cpath} not found, skipping.")
+            continue
+        n_idx, a_idx, p_idx, n_ents = build_indexes_from_file(cpath, country_filter=country)
+        
+        # Merge into main indexes
+        for token, posting in n_idx.index.items():
+            name_idx.index[token].update(posting)
+        for token, posting in a_idx.index.items():
+            addr_idx.index[token].update(posting)
+        for token, posting in p_idx.index.items():
+            postal_idx.index[token].update(posting)
+        
+        total_cands += n_ents
+        print(f"    Loaded {n_ents:,} candidates from {cpath.name}")
+    
+    t_index = time.time() - t0
+    
+    name_stats = name_idx.stats()
+    addr_stats = addr_idx.stats()
+    print(f"  [{country}] Index built in {t_index:.1f}s")
+    print(f"    Name index:  {name_stats['unique_tokens']:,} tokens, "
+          f"{name_stats['total_postings']:,} postings, "
+          f"{name_stats['capped_tokens']:,} capped")
+    print(f"    Addr index:  {addr_stats['unique_tokens']:,} tokens, "
+          f"{addr_stats['total_postings']:,} postings")
+    print(f"    Total candidates: {total_cands:,}")
+    
+    # Now scan S1 and generate pairs
+    print(f"  [{country}] Generating candidate pairs...")
+    t1 = time.time()
+    
+    mode = 'a' if append else 'w'
+    s1_count = 0
+    total_pairs = 0
+    candidates_per_s1 = []
+    
+    with open(s1_filepath, 'r', encoding='utf-8') as fin, \
+         open(output_file, mode, encoding='utf-8') as fout:
+        
+        header = fin.readline().strip().split('\t')
+        col_map = {col: i for i, col in enumerate(header)}
+        eid_i = col_map['entity_id']
+        country_i = col_map['country']
+        norm_name_i = col_map.get('norm_name')
+        norm_addr_i = col_map.get('norm_address')
+        postal_i = col_map.get('postal_code')
+        
+        # Write output header if not appending
+        if not append:
+            fout.write("s1_entity_id\tcand_entity_id\tcand_source\tcountry\t"
+                       "name_overlap\taddr_overlap\tpostal_match\n")
+        
+        for line in fin:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) <= max(eid_i, country_i):
+                continue
+            if parts[country_i].strip() != country:
+                continue
+            
+            s1_id = parts[eid_i].strip()
+            s1_count += 1
+            
+            # Channel 1: Name token overlap
+            s1_name_tokens = set()
+            if norm_name_i is not None and norm_name_i < len(parts):
+                s1_name_tokens = tokenize(parts[norm_name_i])
+            name_hits = name_idx.lookup(s1_name_tokens)
+            
+            # Channel 2: Address token overlap
+            s1_addr_tokens = set()
+            if norm_addr_i is not None and norm_addr_i < len(parts):
+                s1_addr_tokens = tokenize(parts[norm_addr_i])
+            addr_hits = addr_idx.lookup(s1_addr_tokens)
+            
+            # Channel 3: Postal code exact match
+            s1_postal = ''
+            if postal_i is not None and postal_i < len(parts):
+                s1_postal = parts[postal_i].strip()
+            postal_hits = set()
+            if s1_postal and s1_postal in postal_idx.index:
+                postal_hits = postal_idx.index[s1_postal]
+            
+            # Union all candidate IDs across channels
+            all_cand_ids = set(name_hits.keys()) | set(addr_hits.keys()) | postal_hits
+            
+            if not all_cand_ids:
+                candidates_per_s1.append(0)
+                continue
+            
+            # Score each candidate: name_overlap + addr_overlap + postal_bonus
+            scored = []
+            for cid in all_cand_ids:
+                n_ov = name_hits.get(cid, 0)
+                a_ov = addr_hits.get(cid, 0)
+                p_match = 1 if cid in postal_hits else 0
+                # Combined score: name overlap weighted higher
+                score = n_ov * 3 + a_ov * 2 + p_match * 5
+                scored.append((cid, n_ov, a_ov, p_match, score))
+            
+            # Sort by score descending, take top-K
+            scored.sort(key=lambda x: -x[4])
+            top = scored[:max_candidates]
+            
+            candidates_per_s1.append(len(top))
+            
+            # Write pairs
+            for cid, n_ov, a_ov, p_match, _ in top:
+                src = derive_source(cid)
+                fout.write(f"{s1_id}\t{cid}\t{src}\t{country}\t"
+                           f"{n_ov}\t{a_ov}\t{p_match}\n")
+                total_pairs += 1
+            
+            if s1_count % 100_000 == 0:
+                print(f"    Processed {s1_count:,} S1 entities, "
+                      f"{total_pairs:,} pairs so far...")
+    
+    t_gen = time.time() - t1
+    
+    # Stats
+    if candidates_per_s1:
+        candidates_per_s1.sort()
+        median_cands = candidates_per_s1[len(candidates_per_s1) // 2]
+        avg_cands = sum(candidates_per_s1) / len(candidates_per_s1)
+        zero_cands = sum(1 for x in candidates_per_s1 if x == 0)
+    else:
+        median_cands = avg_cands = zero_cands = 0
+    
+    stats = {
+        'country': country,
+        's1_count': s1_count,
+        'cand_count': total_cands,
+        'total_pairs': total_pairs,
+        'avg_cands_per_s1': avg_cands,
+        'median_cands_per_s1': median_cands,
+        'zero_candidate_s1': zero_cands,
+        'index_time': t_index,
+        'gen_time': t_gen,
+    }
+    
+    print(f"  [{country}] Done in {t_gen:.1f}s")
+    print(f"    S1 entities:        {s1_count:,}")
+    print(f"    Total pairs:        {total_pairs:,}")
+    print(f"    Avg cands/S1:       {avg_cands:.1f}")
+    print(f"    Median cands/S1:    {median_cands}")
+    print(f"    S1 with 0 cands:    {zero_cands:,} ({zero_cands/max(s1_count,1)*100:.1f}%)")
+    
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BLOCKING RECALL CHECK
+# ═══════════════════════════════════════════════════════════════════
+
+def load_ground_truth(gt_path):
+    """Load ground truth as a set of (s1_id, cand_id) pairs.
+    
+    Returns:
+        gt_pairs: set of (s1_id, cand_id) tuples
+        gt_map: dict s1_id -> set of cand_ids
+    """
+    gt_pairs = set()
+    gt_map = defaultdict(set)
+    
+    with open(gt_path, 'r', encoding='utf-8') as f:
+        f.readline()  # skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            s1_id = parts[0].strip()
+            if len(parts) > 1 and parts[1].strip():
+                for cid in parts[1].split(','):
+                    cid = cid.strip()
+                    if cid:
+                        gt_pairs.add((s1_id, cid))
+                        gt_map[s1_id].add(cid)
+    
+    return gt_pairs, gt_map
+
+
+def measure_blocking_recall(candidate_pairs_path, gt_path):
+    """Measure what fraction of ground-truth pairs survived blocking.
+    
+    This is THE critical gate:
+      - recall >= 95%: proceed with token blocking, use E5 as feature only
+      - recall < 95%:  add E5 retrieval as 4th blocking channel
+    
+    Args:
+        candidate_pairs_path: path to blocking output TSV
+        gt_path: path to ground truth TSV
+    
+    Returns:
+        dict with recall statistics
+    """
+    print(f"\n{'='*60}")
+    print(f"  BLOCKING RECALL CHECK")
+    print(f"{'='*60}")
+    
+    t0 = time.time()
+    
+    # Load ground truth
+    print(f"  Loading ground truth from {gt_path.name}...")
+    gt_pairs, gt_map = load_ground_truth(gt_path)
+    print(f"  Ground truth: {len(gt_map):,} S1 entities, {len(gt_pairs):,} true pairs")
+    
+    # Load blocked candidate pairs
+    print(f"  Loading candidate pairs from {candidate_pairs_path.name}...")
+    blocked_pairs = set()
+    with open(candidate_pairs_path, 'r', encoding='utf-8') as f:
+        f.readline()  # skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                blocked_pairs.add((parts[0].strip(), parts[1].strip()))
+    
+    print(f"  Blocked pairs: {len(blocked_pairs):,}")
+    
+    # Compute recall
+    found = gt_pairs & blocked_pairs
+    missed = gt_pairs - blocked_pairs
+    
+    recall = len(found) / len(gt_pairs) if gt_pairs else 0.0
+    
+    # Per-country breakdown
+    country_stats = defaultdict(lambda: {'found': 0, 'total': 0})
+    for s1_id, cid in gt_pairs:
+        # Infer country from the candidate pairs file or just count
+        country_stats['all']['total'] += 1
+        if (s1_id, cid) in found:
+            country_stats['all']['found'] += 1
+    
+    elapsed = time.time() - t0
+    
+    print(f"\n  RESULTS (computed in {elapsed:.1f}s):")
+    print(f"    True pairs:     {len(gt_pairs):,}")
+    print(f"    Found by block: {len(found):,}")
+    print(f"    Missed:         {len(missed):,}")
+    print(f"    BLOCKING RECALL: {recall:.4f} ({recall*100:.2f}%)")
+    
+    if recall >= 0.95:
+        print(f"\n    >> PASS: Recall >= 95%. Token blocking is sufficient.")
+        print(f"    >> E5 can be used as a downstream FEATURE only.")
+    else:
+        print(f"\n    >> WARNING: Recall < 95%. Consider adding E5 retrieval")
+        print(f"    >> as a 4th blocking channel to recover missed pairs.")
+    
+    # Show sample of missed pairs
+    if missed:
+        print(f"\n  Sample missed pairs (first 10):")
+        for s1_id, cid in list(missed)[:10]:
+            print(f"    {s1_id} -- {cid}")
+    
+    return {
+        'total_gt_pairs': len(gt_pairs),
+        'found': len(found),
+        'missed': len(missed),
+        'recall': recall,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PIPELINE ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+def run_blocking(mode='train'):
+    """Run blocking on train or test data.
+    
+    Args:
+        mode: 'train' to block train data (with recall check),
+              'test' to block test data (no recall check)
+    """
+    print("=" * 60)
+    print(f"  BLOCKING (mode={mode})")
+    print("=" * 60)
+    
+    norm_dir = config.DATA_ROOT / "normalized"
+    block_dir = config.DATA_ROOT / "blocked"
+    os.makedirs(block_dir, exist_ok=True)
+    
+    if mode == 'train':
+        s1_path = norm_dir / "train_source1_norm.tsv"
+        cand_paths = [
+            norm_dir / "train_source2_norm.tsv",
+            norm_dir / "train_source3_norm.tsv",
+        ]
+        output_path = block_dir / "train_candidate_pairs.tsv"
+        countries = ['US', 'India']
+    else:
+        s1_path = norm_dir / "test_source1_norm.tsv"
+        cand_paths = [
+            norm_dir / "test_source2_norm.tsv",
+            norm_dir / "test_source3_norm.tsv",
+        ]
+        output_path = block_dir / "test_candidate_pairs.tsv"
+        countries = ['US', 'India', 'France']
+    
+    if not s1_path.exists():
+        print(f"  ERROR: {s1_path} not found. Run normalization first.")
+        return
+    
+    all_stats = []
+    for i, country in enumerate(countries):
+        stats = generate_candidates_for_country(
+            s1_filepath=s1_path,
+            cand_filepaths=cand_paths,
+            country=country,
+            output_file=output_path,
+            append=(i > 0),  # first country writes header, rest append
+        )
+        all_stats.append(stats)
+    
+    # Summary
+    total_pairs = sum(s['total_pairs'] for s in all_stats)
+    total_s1 = sum(s['s1_count'] for s in all_stats)
+    print(f"\n  BLOCKING SUMMARY:")
+    print(f"    Total S1 entities: {total_s1:,}")
+    print(f"    Total candidate pairs: {total_pairs:,}")
+    print(f"    Output: {output_path}")
+    
+    # Blocking recall check (train mode only)
+    if mode == 'train' and config.TRAIN_GT.exists():
+        recall_stats = measure_blocking_recall(output_path, config.TRAIN_GT)
+    
+    print("\n" + "=" * 60)
+    print("  BLOCKING COMPLETE")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run_blocking(mode='train')
