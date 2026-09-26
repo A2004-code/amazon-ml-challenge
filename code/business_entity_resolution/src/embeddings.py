@@ -156,6 +156,12 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     if cache_valid:
         print(f"  Loading embeddings from cache...")
         s1_id_arr = np.load(s1_ids_cache, allow_pickle=True)
+        cand_id_arr = np.load(cand_ids_cache, allow_pickle=True)
+        
+        # Verify cache covers all needed IDs
+        cached_s1 = set(s1_id_arr)
+        cached_cand = set(cand_id_arr)
+        
         if s1_ids.issubset(cached_s1) and cand_ids.issubset(cached_cand):
             print(f"  Cache hit: {len(s1_id_arr):,} S1 + {len(cand_id_arr):,} candidates")
             # Load as memory-mapped to keep RAM usage near zero
@@ -163,12 +169,7 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
             s1_addr_emb = np.load(s1_addr_cache, mmap_mode='r')
             cand_name_emb = np.load(cand_name_cache, mmap_mode='r')
             cand_addr_emb = np.load(cand_addr_cache, mmap_mode='r')
-        
-        # Verify cache covers all needed IDs
-        cached_s1 = set(s1_id_arr)
-        cached_cand = set(cand_id_arr)
-        if s1_ids.issubset(cached_s1) and cand_ids.issubset(cached_cand):
-            print(f"  Cache hit: {len(s1_id_arr):,} S1 + {len(cand_id_arr):,} candidates")
+            
             s1_id_to_idx = {eid: i for i, eid in enumerate(s1_id_arr)}
             cand_id_to_idx = {eid: i for i, eid in enumerate(cand_id_arr)}
             return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
