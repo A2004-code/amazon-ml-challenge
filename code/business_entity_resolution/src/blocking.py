@@ -242,13 +242,14 @@ def generate_candidates_for_country(
     t0 = time.time()
     
     # Build indexes from all candidate files (S2 + S3)
-    # Use inf so NO token gets dropped during the merge — apply_cap() does the
-    # global cap after all files are merged. Postal codes have a much higher cap
-    # than name/address tokens because a postal code appearing in 50k candidates
-    # is still useful as a blocking signal, unlike a common word like 'street'.
-    name_idx = InvertedIndex(max_postings=float('inf'))
-    addr_idx = InvertedIndex(max_postings=float('inf'))
-    postal_idx = InvertedIndex(max_postings=float('inf'))  # cap applied later via apply_cap()
+    # name_idx and addr_idx use the configured cap (5000) so apply_cap() actually
+    # removes over-common tokens after the merge. We build per-file with inf to
+    # avoid premature per-file caps that can lose candidates, then apply the
+    # real global cap once after all sources are merged.
+    # postal_idx starts as inf and gets its dedicated 50k cap set before apply_cap().
+    name_idx = InvertedIndex(max_postings=config.BLOCKING_MAX_POSTINGS)
+    addr_idx = InvertedIndex(max_postings=config.BLOCKING_MAX_POSTINGS)
+    postal_idx = InvertedIndex(max_postings=float('inf'))  # cap set to 50k before apply_cap()
     total_cands = 0
     
     for cpath in cand_filepaths:
