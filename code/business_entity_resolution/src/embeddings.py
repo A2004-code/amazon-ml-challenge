@@ -156,11 +156,13 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     if cache_valid:
         print(f"  Loading embeddings from cache...")
         s1_id_arr = np.load(s1_ids_cache, allow_pickle=True)
-        s1_name_emb = np.load(s1_name_cache)
-        s1_addr_emb = np.load(s1_addr_cache)
-        cand_id_arr = np.load(cand_ids_cache, allow_pickle=True)
-        cand_name_emb = np.load(cand_name_cache)
-        cand_addr_emb = np.load(cand_addr_cache)
+        if s1_ids.issubset(cached_s1) and cand_ids.issubset(cached_cand):
+            print(f"  Cache hit: {len(s1_id_arr):,} S1 + {len(cand_id_arr):,} candidates")
+            # Load as memory-mapped to keep RAM usage near zero
+            s1_name_emb = np.load(s1_name_cache, mmap_mode='r')
+            s1_addr_emb = np.load(s1_addr_cache, mmap_mode='r')
+            cand_name_emb = np.load(cand_name_cache, mmap_mode='r')
+            cand_addr_emb = np.load(cand_addr_cache, mmap_mode='r')
         
         # Verify cache covers all needed IDs
         cached_s1 = set(s1_id_arr)
@@ -200,34 +202,56 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     cand_names = [cand_texts.get(eid, {}).get('norm_name', '') for eid in cand_id_list]
     cand_addrs = [cand_texts.get(eid, {}).get('norm_address', '') for eid in cand_id_list]
     
+    # Aggressive memory cleanup
+    del s1_texts
+    del cand_texts
+    import gc
+    gc.collect()
+    
+    # Save IDs to cache immediately
+    np.save(s1_ids_cache, np.array(s1_id_list, dtype=object))
+    np.save(cand_ids_cache, np.array(cand_id_list, dtype=object))
+    
     # Load E5 model
     print(f"\n  Loading E5 model: {config.E5_MODEL_NAME}")
     t0 = time.time()
     model = SentenceTransformer(config.E5_MODEL_NAME)
     print(f"  Model loaded in {time.time()-t0:.1f}s")
     
-    # Encode S1 names
+    # Encode S1 names -> Save -> Clear RAM
     print(f"\n  Encoding {len(s1_names):,} S1 names...")
     t0 = time.time()
-    s1_name_emb = encode_texts(model, s1_names, prefix="query: ")
+    emb = encode_texts(model, s1_names, prefix="query: ")
+    np.save(s1_name_cache, emb)
+    del s1_names, emb
+    gc.collect()
     print(f"  Done in {time.time()-t0:.1f}s")
     
-    # Encode S1 addresses
+    # Encode S1 addresses -> Save -> Clear RAM
     print(f"  Encoding {len(s1_addrs):,} S1 addresses...")
     t0 = time.time()
-    s1_addr_emb = encode_texts(model, s1_addrs, prefix="query: ")
+    emb = encode_texts(model, s1_addrs, prefix="query: ")
+    np.save(s1_addr_cache, emb)
+    del s1_addrs, emb
+    gc.collect()
     print(f"  Done in {time.time()-t0:.1f}s")
     
-    # Encode candidate names
+    # Encode candidate names -> Save -> Clear RAM
     print(f"\n  Encoding {len(cand_names):,} candidate names...")
     t0 = time.time()
-    cand_name_emb = encode_texts(model, cand_names, prefix="passage: ")
+    emb = encode_texts(model, cand_names, prefix="passage: ")
+    np.save(cand_name_cache, emb)
+    del cand_names, emb
+    gc.collect()
     print(f"  Done in {time.time()-t0:.1f}s")
     
-    # Encode candidate addresses
+    # Encode candidate addresses -> Save -> Clear RAM
     print(f"  Encoding {len(cand_addrs):,} candidate addresses...")
     t0 = time.time()
-    cand_addr_emb = encode_texts(model, cand_addrs, prefix="passage: ")
+    emb = encode_texts(model, cand_addrs, prefix="passage: ")
+    np.save(cand_addr_cache, emb)
+    del cand_addrs, emb
+    gc.collect()
     print(f"  Done in {time.time()-t0:.1f}s")
     
     # Build lightweight ID to index mappings
@@ -235,18 +259,17 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     s1_id_to_idx = {eid: i for i, eid in enumerate(s1_id_list)}
     cand_id_to_idx = {eid: i for i, eid in enumerate(cand_id_list)}
     
-    # Save to cache
-    print(f"  Saving embeddings to cache...")
-    np.save(s1_ids_cache, np.array(s1_id_list, dtype=object))
-    np.save(s1_name_cache, s1_name_emb)
-    np.save(s1_addr_cache, s1_addr_emb)
-    np.save(cand_ids_cache, np.array(cand_id_list, dtype=object))
-    np.save(cand_name_cache, cand_name_emb)
-    np.save(cand_addr_cache, cand_addr_emb)
     print(f"  Cached to {cache_dir}")
     
     # Free GPU memory
     del model
+    gc.collect()
+    
+    # Load back as memory-mapped arrays to keep RAM footprint near zero
+    s1_name_emb = np.load(s1_name_cache, mmap_mode='r')
+    s1_addr_emb = np.load(s1_addr_cache, mmap_mode='r')
+    cand_name_emb = np.load(cand_name_cache, mmap_mode='r')
+    cand_addr_emb = np.load(cand_addr_cache, mmap_mode='r')
     
     return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
 
