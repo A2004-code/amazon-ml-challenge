@@ -264,34 +264,12 @@ def compute_features_for_pairs(pairs_path, norm_dir, output_path, mode='train'):
     
     t0 = time.time()
     
-    # Load all candidate pairs grouped by country
-    print(f"  Loading candidate pairs...")
-    pairs_by_country = defaultdict(list)
-    with open(pairs_path, 'r', encoding='utf-8') as f:
-        header = f.readline().strip().split('\t')
-        col_map = {col: i for i, col in enumerate(header)}
-        
-        for line in f:
-            parts = line.rstrip('\n').split('\t')
-            country = parts[col_map['country']].strip()
-            pairs_by_country[country].append({
-                's1_entity_id': parts[col_map['s1_entity_id']],
-                'cand_entity_id': parts[col_map['cand_entity_id']],
-                'cand_source': parts[col_map['cand_source']],
-                'name_overlap': int(parts[col_map['name_overlap']]),
-                'addr_overlap': int(parts[col_map['addr_overlap']]),
-                'postal_match': int(parts[col_map['postal_match']]),
-            })
-    
-    total_pairs = sum(len(v) for v in pairs_by_country.values())
-    print(f"  Total pairs: {total_pairs:,} across {list(pairs_by_country.keys())}")
-    
-    # Process country by country
+    # Stream candidate pairs grouped by country
+    print(f"  Streaming candidate pairs...")
     os.makedirs(output_path.parent, exist_ok=True)
     first_write = True
     total_computed = 0
     
-    # Define the traditional feature columns (without E5 — those come from embeddings.py)
     trad_feature_cols = [
         'name_jaccard', 'name_levenshtein', 'name_jaro_winkler',
         'name_token_sort', 'name_token_set',
@@ -302,18 +280,17 @@ def compute_features_for_pairs(pairs_path, norm_dir, output_path, mode='train'):
         'name_overlap', 'addr_overlap', 'postal_match',
     ]
     
-    for country, pairs in pairs_by_country.items():
-        print(f"\n  [{country}] Computing features for {len(pairs):,} pairs...")
-        t1 = time.time()
+    current_country = None
+    s1_lookup = {}
+    cand_lookup = {}
+    batch = []
+    
+    def flush_batch(cntry):
+        nonlocal first_write, batch, total_computed
+        if not batch: return
         
-        # Load entity lookups for this country
-        s1_lookup, cand_lookup = load_entity_lookups_for_country(
-            norm_dir, mode, country
-        )
-        
-        # Compute features for each pair
         rows = []
-        for i, pair in enumerate(pairs):
+        for pair in batch:
             s1_id = pair['s1_entity_id']
             cand_id = pair['cand_entity_id']
             
@@ -332,21 +309,15 @@ def compute_features_for_pairs(pairs_path, norm_dir, output_path, mode='train'):
                 postal_match=pair['postal_match'],
             )
             
-            # Add metadata columns
             feats['s1_entity_id'] = s1_id
             feats['cand_entity_id'] = cand_id
             feats['cand_source'] = pair['cand_source']
-            feats['country'] = country
+            feats['country'] = cntry
             rows.append(feats)
-            
-            if (i + 1) % 500_000 == 0:
-                print(f"    [{country}] Computed {i+1:,} / {len(pairs):,} pairs...")
         
-        # Write to output
         df = pd.DataFrame(rows)
         meta_cols = ['s1_entity_id', 'cand_entity_id', 'cand_source', 'country']
-        col_order = meta_cols + trad_feature_cols
-        df = df[col_order]
+        df = df[meta_cols + trad_feature_cols]
         
         df.to_csv(
             output_path, sep='\t', index=False,
@@ -356,13 +327,45 @@ def compute_features_for_pairs(pairs_path, norm_dir, output_path, mode='train'):
         )
         first_write = False
         total_computed += len(rows)
+        batch.clear()
+
+    with open(pairs_path, 'r', encoding='utf-8') as f:
+        header = f.readline().strip().split('\t')
+        col_map = {col: i for i, col in enumerate(header)}
         
-        elapsed = time.time() - t1
-        print(f"    [{country}] Done: {len(rows):,} pairs in {elapsed:.1f}s "
-              f"({len(rows)/max(elapsed,0.1):.0f} pairs/sec)")
-        
-        # Free memory
-        del s1_lookup, cand_lookup, rows, df
+        for i, line in enumerate(f):
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) <= col_map['country']:
+                continue
+            
+            country = parts[col_map['country']].strip()
+            
+            if country != current_country:
+                if current_country is not None:
+                    flush_batch(current_country)
+                    print(f"    [{current_country}] Finished partition.")
+                
+                current_country = country
+                print(f"\n  [{country}] Loading lookups...")
+                s1_lookup, cand_lookup = load_entity_lookups_for_country(norm_dir, mode, country)
+                print(f"  [{country}] Computing features...")
+            
+            batch.append({
+                's1_entity_id': parts[col_map['s1_entity_id']],
+                'cand_entity_id': parts[col_map['cand_entity_id']],
+                'cand_source': parts[col_map['cand_source']],
+                'name_overlap': int(parts[col_map['name_overlap']]),
+                'addr_overlap': int(parts[col_map['addr_overlap']]),
+                'postal_match': int(parts[col_map['postal_match']]),
+            })
+            
+            if len(batch) >= 100_000:
+                flush_batch(current_country)
+                print(f"    [{current_country}] Computed {total_computed:,} pairs...")
+                
+    if current_country is not None:
+        flush_batch(current_country)
+        print(f"    [{current_country}] Finished partition.")
     
     total_elapsed = time.time() - t0
     print(f"\n  FEATURE ENGINEERING COMPLETE")
