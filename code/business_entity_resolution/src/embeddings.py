@@ -116,7 +116,9 @@ def encode_texts(model, texts, prefix, batch_size=None):
 def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     """Compute E5 embeddings for all entities in candidate pairs.
     
-    Saves embeddings to cache (.npy) and returns dense arrays + index maps.
+    Saves embeddings to cache (.npy). Returns only lightweight ID maps
+    and cache paths — the actual arrays are loaded separately by the
+    two-pass merge to stay under 25 GB RAM.
     
     Args:
         pairs_path: path to candidate_pairs.tsv
@@ -124,8 +126,8 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
         mode: 'train' or 'test'
     
     Returns:
-        (s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb,
-         s1_id_to_idx, cand_id_to_idx)
+        (s1_id_to_idx, cand_id_to_idx, cache_paths)
+        cache_paths is a dict with keys: s1_name, s1_addr, cand_name, cand_addr
     """
     # Lazy import — only needed on GPU machine
     from sentence_transformers import SentenceTransformer
@@ -140,6 +142,11 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     cand_name_cache = cache_dir / f"{prefix}_cand_name_emb.npy"
     cand_addr_cache = cache_dir / f"{prefix}_cand_addr_emb.npy"
     cand_ids_cache = cache_dir / f"{prefix}_cand_ids.npy"
+    
+    cache_paths = {
+        's1_name': s1_name_cache, 's1_addr': s1_addr_cache,
+        'cand_name': cand_name_cache, 'cand_addr': cand_addr_cache,
+    }
     
     # Collect entity IDs from candidate pairs
     print(f"  Collecting entity IDs from {pairs_path.name}...")
@@ -164,15 +171,9 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
         
         if s1_ids.issubset(cached_s1) and cand_ids.issubset(cached_cand):
             print(f"  Cache hit: {len(s1_id_arr):,} S1 + {len(cand_id_arr):,} candidates")
-            # Load fully into RAM — mmap is too slow on network storage
-            s1_name_emb = np.load(s1_name_cache)
-            s1_addr_emb = np.load(s1_addr_cache)
-            cand_name_emb = np.load(cand_name_cache)
-            cand_addr_emb = np.load(cand_addr_cache)
-            
             s1_id_to_idx = {eid: i for i, eid in enumerate(s1_id_arr)}
             cand_id_to_idx = {eid: i for i, eid in enumerate(cand_id_arr)}
-            return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
+            return s1_id_to_idx, cand_id_to_idx, cache_paths
         else:
             print(f"  Cache incomplete, recomputing...")
     
@@ -266,20 +267,74 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     del model
     gc.collect()
     
-    # Load back into RAM for fast merge (model + texts are freed, ~44GB fits in 50GB)
-    s1_name_emb = np.load(s1_name_cache)
-    s1_addr_emb = np.load(s1_addr_cache)
-    cand_name_emb = np.load(cand_name_cache)
-    cand_addr_emb = np.load(cand_addr_cache)
+    return s1_id_to_idx, cand_id_to_idx, cache_paths
+
+
+def _cosine_pass(features_input, output_path, s1_id_to_idx, cand_id_to_idx,
+                 s1_emb, cand_emb, col_name, first_pass=True):
+    """Single-pass: read chunks, compute one cosine column, write output.
     
-    return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
+    Args:
+        features_input: path to input TSV (features or intermediate)
+        output_path: path to write output TSV
+        s1_id_to_idx: dict mapping S1 entity_id -> row index
+        cand_id_to_idx: dict mapping cand entity_id -> row index
+        s1_emb: numpy array (n_s1, 768) — one embedding type (name or addr)
+        cand_emb: numpy array (n_cand, 768) — matching type
+        col_name: column name for the cosine score (e.g. 'e5_name_cosine')
+        first_pass: if True, also add a placeholder for the other cosine column
+    """
+    import pandas as pd
+    
+    chunksize = 500_000
+    reader = pd.read_csv(
+        features_input, sep='\t', encoding='utf-8',
+        chunksize=chunksize, dtype={'s1_entity_id': str, 'cand_entity_id': str},
+    )
+    
+    first_write = True
+    total_pairs = 0
+    
+    for chunk in reader:
+        s1_indices = np.array([s1_id_to_idx.get(eid, -1) for eid in chunk['s1_entity_id']])
+        cand_indices = np.array([cand_id_to_idx.get(eid, -1) for eid in chunk['cand_entity_id']])
+        
+        valid_s1 = s1_indices >= 0
+        valid_cand = cand_indices >= 0
+        
+        s1_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        cand_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
+        
+        if valid_s1.any():
+            s1_mat[valid_s1] = s1_emb[s1_indices[valid_s1]]
+        if valid_cand.any():
+            cand_mat[valid_cand] = cand_emb[cand_indices[valid_cand]]
+        
+        chunk[col_name] = (s1_mat * cand_mat).sum(axis=1)
+        
+        # On first pass, add placeholder for the second cosine column
+        if first_pass and 'e5_addr_cosine' not in chunk.columns:
+            chunk['e5_addr_cosine'] = 0.0
+        
+        chunk.to_csv(
+            output_path, sep='\t', index=False,
+            mode='w' if first_write else 'a',
+            header=first_write,
+            encoding='utf-8',
+        )
+        first_write = False
+        total_pairs += len(chunk)
+        print(f"    Processed {total_pairs:,} pairs...")
+    
+    return total_pairs
 
 
 def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='train'):
     """Compute E5 cosine similarities and merge with traditional features.
     
-    Reads the traditional features TSV, adds e5_name_cosine and e5_addr_cosine
-    columns, writes the combined output.
+    Uses a two-pass approach to stay under 25GB RAM:
+      Pass 1: Load name embeddings (~22GB), compute e5_name_cosine
+      Pass 2: Load addr embeddings (~22GB), compute e5_addr_cosine
     
     Args:
         features_path: path to traditional features TSV (from features.py)
@@ -288,6 +343,8 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
         output_path: path to write combined features TSV
         mode: 'train' or 'test'
     """
+    import gc
+    
     print(f"\n{'='*60}")
     print(f"  E5 EMBEDDING FEATURES")
     print(f"{'='*60}")
@@ -298,64 +355,55 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     
     t0 = time.time()
     
-    # Compute embeddings (or load from cache)
-    s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx = \
+    # Compute embeddings (or verify cache) — returns lightweight maps only
+    s1_id_to_idx, cand_id_to_idx, cache_paths = \
         compute_e5_embeddings(pairs_path, norm_dir, mode)
     
-    # Read features TSV and add E5 columns
-    print(f"\n  Merging E5 features with traditional features...")
+    # ── Pass 1: Name cosine (~22 GB) ─────────────────────────────
+    print(f"\n  Pass 1/2: Loading name embeddings into RAM...")
+    t1 = time.time()
+    s1_name_emb = np.load(cache_paths['s1_name'])
+    cand_name_emb = np.load(cache_paths['cand_name'])
+    print(f"  Loaded in {time.time()-t1:.1f}s  "
+          f"({s1_name_emb.nbytes/1e9:.1f} + {cand_name_emb.nbytes/1e9:.1f} = "
+          f"{(s1_name_emb.nbytes + cand_name_emb.nbytes)/1e9:.1f} GB)")
     
-    import pandas as pd
-    
-    # Process in chunks to manage memory
-    chunksize = 500_000
-    reader = pd.read_csv(
-        features_path, sep='\t', encoding='utf-8',
-        chunksize=chunksize, dtype={'s1_entity_id': str, 'cand_entity_id': str},
+    temp_path = output_path.with_suffix('.tmp')
+    total_pairs = _cosine_pass(
+        features_path, temp_path,
+        s1_id_to_idx, cand_id_to_idx,
+        s1_name_emb, cand_name_emb,
+        col_name='e5_name_cosine', first_pass=True,
     )
     
-    first_write = True
-    total_pairs = 0
-    zero_emb = np.zeros(config.E5_EMBEDDING_DIM, dtype=np.float32)
+    del s1_name_emb, cand_name_emb
+    gc.collect()
+    print(f"  Pass 1 done in {time.time()-t1:.1f}s")
     
-    for chunk in reader:
-        # Convert indices to numpy arrays for fast bulk indexing
-        s1_indices = np.array([s1_id_to_idx.get(eid, -1) for eid in chunk['s1_entity_id']])
-        cand_indices = np.array([cand_id_to_idx.get(eid, -1) for eid in chunk['cand_entity_id']])
-        
-        valid_s1 = s1_indices >= 0
-        valid_cand = cand_indices >= 0
-
-        # Build embedding matrices via vectorized C-level memmap lookups
-        s1_name_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
-        if valid_s1.any():
-            s1_name_mat[valid_s1] = s1_name_emb[s1_indices[valid_s1]]
-            
-        cand_name_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
-        if valid_cand.any():
-            cand_name_mat[valid_cand] = cand_name_emb[cand_indices[valid_cand]]
-            
-        s1_addr_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
-        if valid_s1.any():
-            s1_addr_mat[valid_s1] = s1_addr_emb[s1_indices[valid_s1]]
-            
-        cand_addr_mat = np.zeros((len(chunk), config.E5_EMBEDDING_DIM), dtype=np.float32)
-        if valid_cand.any():
-            cand_addr_mat[valid_cand] = cand_addr_emb[cand_indices[valid_cand]]
-
-        # Element-wise multiply then sum across embedding dim — one numpy op per similarity
-        chunk['e5_name_cosine'] = (s1_name_mat * cand_name_mat).sum(axis=1)
-        chunk['e5_addr_cosine'] = (s1_addr_mat * cand_addr_mat).sum(axis=1)
-
-        chunk.to_csv(
-            output_path, sep='\t', index=False,
-            mode='w' if first_write else 'a',
-            header=first_write,
-            encoding='utf-8',
-        )
-        first_write = False
-        total_pairs += len(chunk)
-        print(f"    Processed {total_pairs:,} pairs...")
+    # ── Pass 2: Address cosine (~22 GB) ──────────────────────────
+    print(f"\n  Pass 2/2: Loading address embeddings into RAM...")
+    t2 = time.time()
+    s1_addr_emb = np.load(cache_paths['s1_addr'])
+    cand_addr_emb = np.load(cache_paths['cand_addr'])
+    print(f"  Loaded in {time.time()-t2:.1f}s  "
+          f"({s1_addr_emb.nbytes/1e9:.1f} + {cand_addr_emb.nbytes/1e9:.1f} = "
+          f"{(s1_addr_emb.nbytes + cand_addr_emb.nbytes)/1e9:.1f} GB)")
+    
+    total_pairs = _cosine_pass(
+        temp_path, output_path,
+        s1_id_to_idx, cand_id_to_idx,
+        s1_addr_emb, cand_addr_emb,
+        col_name='e5_addr_cosine', first_pass=False,
+    )
+    
+    del s1_addr_emb, cand_addr_emb
+    gc.collect()
+    
+    # Clean up temp file
+    if temp_path.exists():
+        temp_path.unlink()
+    
+    print(f"  Pass 2 done in {time.time()-t2:.1f}s")
     
     total_elapsed = time.time() - t0
     print(f"\n  E5 FEATURES COMPLETE")
