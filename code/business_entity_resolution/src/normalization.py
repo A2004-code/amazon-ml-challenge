@@ -399,11 +399,11 @@ def normalize_source_file(input_path, output_path, source_name, chunksize=500_00
     sample = pd.read_csv(output_path, sep='\t', nrows=5, encoding='utf-8', dtype=str)
     print(f"\n  Sample normalized rows:")
     for _, row in sample.iterrows():
-        print(f"    name:      {row.get(config.COL_NAME, '')[:50]}")
-        print(f"    norm_name: {row.get('norm_name', '')[:50]}")
-        print(f"    core_name: {row.get('core_name', '')[:50]}")
-        print(f"    address:   {row.get(config.COL_ADDRESS, '')[:50]}")
-        print(f"    norm_addr: {row.get('norm_address', '')[:50]}")
+        print(f"    name:      {str(row.get(config.COL_NAME, ''))[:50]}")
+        print(f"    norm_name: {str(row.get('norm_name', ''))[:50]}")
+        print(f"    core_name: {str(row.get('core_name', ''))[:50]}")
+        print(f"    address:   {str(row.get(config.COL_ADDRESS, ''))[:50]}")
+        print(f"    norm_addr: {str(row.get('norm_address', ''))[:50]}")
         print(f"    postal:    {row.get('postal_code', '')}")
         print()
 
