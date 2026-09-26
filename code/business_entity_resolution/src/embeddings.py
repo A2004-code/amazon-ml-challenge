@@ -116,7 +116,7 @@ def encode_texts(model, texts, prefix, batch_size=None):
 def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     """Compute E5 embeddings for all entities in candidate pairs.
     
-    Saves embeddings to cache (.npy) and returns lookup dicts.
+    Saves embeddings to cache (.npy) and returns dense arrays + index maps.
     
     Args:
         pairs_path: path to candidate_pairs.tsv
@@ -124,7 +124,8 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
         mode: 'train' or 'test'
     
     Returns:
-        (s1_emb_lookup, cand_emb_lookup): dicts mapping entity_id -> embedding vector
+        (s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb,
+         s1_id_to_idx, cand_id_to_idx)
     """
     # Lazy import — only needed on GPU machine
     from sentence_transformers import SentenceTransformer
@@ -166,11 +167,9 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
         cached_cand = set(cand_id_arr)
         if s1_ids.issubset(cached_s1) and cand_ids.issubset(cached_cand):
             print(f"  Cache hit: {len(s1_id_arr):,} S1 + {len(cand_id_arr):,} candidates")
-            s1_emb_name_lookup = dict(zip(s1_id_arr, s1_name_emb))
-            s1_emb_addr_lookup = dict(zip(s1_id_arr, s1_addr_emb))
-            cand_emb_name_lookup = dict(zip(cand_id_arr, cand_name_emb))
-            cand_emb_addr_lookup = dict(zip(cand_id_arr, cand_addr_emb))
-            return s1_emb_name_lookup, s1_emb_addr_lookup, cand_emb_name_lookup, cand_emb_addr_lookup
+            s1_id_to_idx = {eid: i for i, eid in enumerate(s1_id_arr)}
+            cand_id_to_idx = {eid: i for i, eid in enumerate(cand_id_arr)}
+            return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
         else:
             print(f"  Cache incomplete, recomputing...")
     
@@ -231,8 +230,13 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     cand_addr_emb = encode_texts(model, cand_addrs, prefix="passage: ")
     print(f"  Done in {time.time()-t0:.1f}s")
     
+    # Build lightweight ID to index mappings
+    print(f"\n  Building index mappings...")
+    s1_id_to_idx = {eid: i for i, eid in enumerate(s1_id_list)}
+    cand_id_to_idx = {eid: i for i, eid in enumerate(cand_id_list)}
+    
     # Save to cache
-    print(f"\n  Saving embeddings to cache...")
+    print(f"  Saving embeddings to cache...")
     np.save(s1_ids_cache, np.array(s1_id_list, dtype=object))
     np.save(s1_name_cache, s1_name_emb)
     np.save(s1_addr_cache, s1_addr_emb)
@@ -241,16 +245,10 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     np.save(cand_addr_cache, cand_addr_emb)
     print(f"  Cached to {cache_dir}")
     
-    # Build lookup dicts
-    s1_emb_name_lookup = dict(zip(s1_id_list, s1_name_emb))
-    s1_emb_addr_lookup = dict(zip(s1_id_list, s1_addr_emb))
-    cand_emb_name_lookup = dict(zip(cand_id_list, cand_name_emb))
-    cand_emb_addr_lookup = dict(zip(cand_id_list, cand_addr_emb))
-    
     # Free GPU memory
     del model
     
-    return s1_emb_name_lookup, s1_emb_addr_lookup, cand_emb_name_lookup, cand_emb_addr_lookup
+    return s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx
 
 
 def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='train'):
@@ -277,7 +275,7 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     t0 = time.time()
     
     # Compute embeddings (or load from cache)
-    s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb = \
+    s1_name_emb, s1_addr_emb, cand_name_emb, cand_addr_emb, s1_id_to_idx, cand_id_to_idx = \
         compute_e5_embeddings(pairs_path, norm_dir, mode)
     
     # Read features TSV and add E5 columns
@@ -297,29 +295,20 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     zero_emb = np.zeros(config.E5_EMBEDDING_DIM, dtype=np.float32)
     
     for chunk in reader:
-        # Compute cosine similarities
-        name_cosines = []
-        addr_cosines = []
-        
-        for _, row in chunk.iterrows():
-            s1_id = str(row['s1_entity_id'])
-            cand_id = str(row['cand_entity_id'])
-            
-            # Name cosine
-            s1_n = s1_name_emb.get(s1_id, zero_emb)
-            c_n = cand_name_emb.get(cand_id, zero_emb)
-            name_cos = float(np.dot(s1_n, c_n))  # already L2-normalized
-            name_cosines.append(name_cos)
-            
-            # Address cosine
-            s1_a = s1_addr_emb.get(s1_id, zero_emb)
-            c_a = cand_addr_emb.get(cand_id, zero_emb)
-            addr_cos = float(np.dot(s1_a, c_a))
-            addr_cosines.append(addr_cos)
-        
-        chunk['e5_name_cosine'] = name_cosines
-        chunk['e5_addr_cosine'] = addr_cosines
-        
+        # Batch index lookup — one list comprehension, no Python loop per row
+        s1_indices  = [s1_id_to_idx.get(eid, -1) for eid in chunk['s1_entity_id']]
+        cand_indices = [cand_id_to_idx.get(eid, -1) for eid in chunk['cand_entity_id']]
+
+        # Build embedding matrices for this chunk (zero-row for any missing ID)
+        s1_name_mat   = np.array([s1_name_emb[i]   if i >= 0 else zero_emb for i in s1_indices])
+        cand_name_mat = np.array([cand_name_emb[i]  if i >= 0 else zero_emb for i in cand_indices])
+        s1_addr_mat   = np.array([s1_addr_emb[i]    if i >= 0 else zero_emb for i in s1_indices])
+        cand_addr_mat = np.array([cand_addr_emb[i]  if i >= 0 else zero_emb for i in cand_indices])
+
+        # Element-wise multiply then sum across embedding dim — one numpy op per similarity
+        chunk['e5_name_cosine'] = (s1_name_mat * cand_name_mat).sum(axis=1)
+        chunk['e5_addr_cosine'] = (s1_addr_mat * cand_addr_mat).sum(axis=1)
+
         chunk.to_csv(
             output_path, sep='\t', index=False,
             mode='w' if first_write else 'a',

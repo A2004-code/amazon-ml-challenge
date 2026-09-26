@@ -447,7 +447,7 @@ def generate_submission(pred_df, all_test_s1_ids, output_dir):
 
     results_path = output_dir / "matching_results.tsv"
     with open(results_path, 'w', encoding='utf-8') as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
+        f.write(f"{config.SUBMIT_COL_S1_ID}\t{config.SUBMIT_COL_MATCHED}\n")
         for s1_id in sorted(all_test_s1_ids):
             matched = ','.join(sorted(set(match_groups.get(s1_id, []))))
             f.write(f"{s1_id}\t{matched}\n")
@@ -461,7 +461,7 @@ def generate_submission(pred_df, all_test_s1_ids, output_dir):
 
     cand_path = output_dir / "candidate_pairs.tsv"
     with open(cand_path, 'w', encoding='utf-8') as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        f.write(f"{config.SUBMIT_COL_S1_ID}\t{config.SUBMIT_COL_CANDS}\n")
         for s1_id in sorted(all_test_s1_ids):
             cands = ','.join(sorted(set(cand_groups.get(s1_id, []))))
             f.write(f"{s1_id}\t{cands}\n")
