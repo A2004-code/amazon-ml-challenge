@@ -107,18 +107,6 @@ LEGAL_DESIGNATIONS = [
     'societe',
     'etablissements',
     'compagnie',
-    'foundation',
-    'trust',
-    'enterprises',
-    'enterprise',
-    'holdings',
-    'holding',
-    'group',
-    'associates',
-    'solutions',
-    'industries',
-    'technologies',
-    'international',
 ]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -174,7 +162,7 @@ ADDRESS_ABBREV_MAP = {
 # India PIN: 6 digits
 # France: 5 digits
 POSTAL_CODE_PATTERN = re.compile(
-    r'\b(\d{5}(?:-\d{4})?)\b'  # US ZIP (12345 or 12345-6789)
+    r'\b(\d{5})(?:-\d{4})?\b'  # US ZIP (12345 or 12345-6789) truncates to base 5
     r'|'
     r'\b(\d{6})\b'             # India PIN (6 digits)
 )
@@ -197,15 +185,28 @@ def strip_accents_latin_only(text):
     nfkd = unicodedata.normalize('NFKD', text)
     
     result = []
+    last_base_is_latin = False
     for ch in nfkd:
         cat = unicodedata.category(ch)
-        # Skip combining marks (Mn = Mark, Nonspacing) 
-        # These are accent marks from Latin decomposition
-        if cat == 'Mn':
-            continue
-        result.append(ch)
+        if cat.startswith('M'):
+            if last_base_is_latin:
+                continue
+            result.append(ch)
+        else:
+            result.append(ch)
+            cp = ord(ch)
+            last_base_is_latin = (0x0041 <= cp <= 0x024F) or (0x1E00 <= cp <= 0x1EFF)
     
     return ''.join(result)
+
+
+def strip_punctuation_keep_marks(text, extra_keep="-'"):
+    """Strip punctuation but explicitly preserve combining marks (Indic signs)."""
+    return "".join(
+        ch if (ch.isalnum() or ch.isspace() or ch in extra_keep or unicodedata.category(ch).startswith('M'))
+        else ' '
+        for ch in text
+    )
 
 
 def normalize_business_name(name):
@@ -229,7 +230,7 @@ def normalize_business_name(name):
     
     # Remove punctuation EXCEPT hyphens and apostrophes (they can be meaningful)
     # e.g., "O'Brien", "Coca-Cola"
-    text = re.sub(r"[^\w\s\-']", ' ', text)
+    text = strip_punctuation_keep_marks(text)
     
     # Expand legal suffix abbreviations
     tokens = text.split()
@@ -295,7 +296,7 @@ def normalize_address(address):
     text = text.replace('&', ' and ')
     
     # Light punctuation removal (keep commas, hyphens, slashes — they separate address parts)
-    text = re.sub(r"[^\w\s,\-/.]", ' ', text)
+    text = strip_punctuation_keep_marks(text, extra_keep=",-/.")
     
     # Expand address abbreviations
     tokens = text.split()
