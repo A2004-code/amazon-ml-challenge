@@ -242,9 +242,10 @@ def generate_candidates_for_country(
     t0 = time.time()
     
     # Build indexes from all candidate files (S2 + S3)
-    name_idx = InvertedIndex()
-    addr_idx = InvertedIndex()
-    postal_idx = InvertedIndex(max_postings=50_000)
+    # Use inf so NO token gets dropped during merge — apply_cap() does global cap after.
+    name_idx = InvertedIndex(max_postings=float('inf'))
+    addr_idx = InvertedIndex(max_postings=float('inf'))
+    postal_idx = InvertedIndex(max_postings=float('inf'))
     total_cands = 0
     
     for cpath in cand_filepaths:
