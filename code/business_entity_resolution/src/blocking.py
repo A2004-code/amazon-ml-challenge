@@ -373,12 +373,9 @@ def generate_candidates_for_country(
                 n_ov = name_hits.get(cid, 0)
                 a_ov = addr_hits.get(cid, 0)
                 p_match = 1 if cid in postal_hits else 0
-                
-                # ENFORCE MINIMUM OVERLAP: Must have some name/postal match OR a very strong address match
-                if n_ov < config.BLOCKING_MIN_NAME_OVERLAP and p_match == 0 and a_ov < 2:
-                    continue
-                    
-                # Combined score: name overlap weighted higher
+                # Note: no extra filter needed here — every candidate in base_cands
+                # already has n_ov >= 1 (from name_hits) OR p_match == 1 (from postal_hits)
+                # by construction. A separate min-overlap filter would be dead code.
                 score = n_ov * 3 + a_ov * 2 + p_match * 5
                 scored.append((cid, n_ov, a_ov, p_match, score))
                 
