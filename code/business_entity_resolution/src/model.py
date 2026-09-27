@@ -59,29 +59,51 @@ def load_ground_truth_pairs(gt_path):
 def generate_labels(features_path, gt_path):
     """Attach binary labels to feature rows using ground truth.
     
-    Args:
-        features_path: path to features TSV (train_features_full.tsv)
-        gt_path: path to ground truth TSV
-    
-    Returns:
-        DataFrame with all features + 'label' column
+    Loads in chunks with float32 to prevent OOM on 135M rows.
     """
     print(f"  Loading ground truth...")
     gt_pairs = load_ground_truth_pairs(gt_path)
     print(f"  Ground truth: {len(gt_pairs):,} true pairs")
     
-    print(f"  Loading features from {features_path.name}...")
-    df = pd.read_csv(
-        features_path, sep='\t', encoding='utf-8',
-        dtype={'s1_entity_id': str, 'cand_entity_id': str},
-    )
-    print(f"  Feature rows: {len(df):,}")
+    print(f"  Loading features from {features_path.name} in chunks...")
     
-    # Generate labels
-    df['label'] = df.apply(
-        lambda row: 1 if (row['s1_entity_id'], row['cand_entity_id']) in gt_pairs else 0,
-        axis=1
+    # Define exact dtypes to cut memory in half (float64 -> float32)
+    dtypes = {'s1_entity_id': str, 'cand_entity_id': str}
+    for col in config.FEATURE_COLS:
+        dtypes[col] = np.float32
+        
+    chunksize = 2_000_000
+    reader = pd.read_csv(
+        features_path, sep='\t', encoding='utf-8',
+        dtype=dtypes, chunksize=chunksize,
+        usecols=['s1_entity_id', 'cand_entity_id'] + config.FEATURE_COLS
     )
+    
+    chunk_list = []
+    total_rows = 0
+    
+    t0 = time.time()
+    for i, chunk in enumerate(reader):
+        # Generate labels (int8)
+        chunk['label'] = chunk.apply(
+            lambda row: 1 if (row['s1_entity_id'], row['cand_entity_id']) in gt_pairs else 0,
+            axis=1
+        ).astype(np.int8)
+        
+        # We don't need cand_entity_id anymore for training, drop to save memory
+        chunk.drop(columns=['cand_entity_id'], inplace=True)
+        
+        chunk_list.append(chunk)
+        total_rows += len(chunk)
+        print(f"    Loaded {total_rows:,} rows... ({(time.time()-t0)/60:.1f} min)")
+        
+    print(f"  Concatenating {len(chunk_list)} chunks into RAM...")
+    df = pd.concat(chunk_list, ignore_index=True)
+    del chunk_list
+    import gc
+    gc.collect()
+    
+    print(f"  Feature rows: {len(df):,}")
     
     n_pos = df['label'].sum()
     n_neg = len(df) - n_pos
