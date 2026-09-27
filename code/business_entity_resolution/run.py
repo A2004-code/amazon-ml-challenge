@@ -118,11 +118,31 @@ Examples:
                 print(f"ERROR: No test features found at {feat_dir}")
                 print("Run: python run.py --block --features --embed --mode test")
                 return
-            print(f"  Loading test features from {feat_path.name}")
-            test_df = pd.read_csv(feat_path, sep='\t', encoding='utf-8',
-                                  dtype={'s1_entity_id': str, 'cand_entity_id': str})
-            pred_df = predict(model, test_df, feature_cols, threshold)
-            generate_submission(pred_df, config.OUTPUT_DIR)
+            
+            print(f"  Loading test features from {feat_path.name} in chunks to prevent memory crash...")
+            chunksize = 5_000_000
+            reader = pd.read_csv(feat_path, sep='\t', encoding='utf-8',
+                                 dtype={'s1_entity_id': str, 'cand_entity_id': str},
+                                 chunksize=chunksize)
+            
+            preds_list = []
+            all_s1_ids = set()
+            processed = 0
+            
+            for chunk in reader:
+                chunk_pred = predict(model, chunk, feature_cols, threshold)
+                # Keep only what we need for submission to save RAM
+                preds_list.append(chunk_pred[['s1_entity_id', 'cand_entity_id', 'match_pred']])
+                all_s1_ids.update(chunk['s1_entity_id'].unique())
+                
+                processed += len(chunk)
+                print(f"    Predicted {processed:,} pairs...")
+                
+            print("  Concatenating all predictions...")
+            pred_df = pd.concat(preds_list, ignore_index=True)
+            
+            print("  Generating Kaggle submission files...")
+            generate_submission(pred_df, all_s1_ids, config.OUTPUT_DIR)
 
     # ── Full Test Pipeline ────────────────────────────────────────
     if args.predict_all:
