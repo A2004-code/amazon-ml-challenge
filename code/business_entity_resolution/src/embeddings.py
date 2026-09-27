@@ -376,14 +376,14 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     s1_id_to_idx, cand_id_to_idx, cache_paths = \
         compute_e5_embeddings(pairs_path, norm_dir, mode)
     
-    # ── Pass 1: Name cosine (~22 GB) ─────────────────────────────
-    print(f"\n  Pass 1/2: Loading name embeddings into RAM...")
+    # ── Pass 1: Name cosine (~22 GB on disk, 0 GB in RAM with mmap) ───
+    print(f"\n  Pass 1/2: Memory-mapping name embeddings...")
     t1 = time.time()
-    s1_name_emb = np.load(cache_paths['s1_name'])
-    cand_name_emb = np.load(cache_paths['cand_name'])
-    print(f"  Loaded in {time.time()-t1:.1f}s  "
+    s1_name_emb = np.load(cache_paths['s1_name'], mmap_mode='r')
+    cand_name_emb = np.load(cache_paths['cand_name'], mmap_mode='r')
+    print(f"  Mapped in {time.time()-t1:.1f}s  "
           f"({s1_name_emb.nbytes/1e9:.1f} + {cand_name_emb.nbytes/1e9:.1f} = "
-          f"{(s1_name_emb.nbytes + cand_name_emb.nbytes)/1e9:.1f} GB)")
+          f"{(s1_name_emb.nbytes + cand_name_emb.nbytes)/1e9:.1f} GB virtual)")
     
     temp_path = output_path.with_suffix('.tmp')
     total_pairs = _cosine_pass(
@@ -397,14 +397,14 @@ def merge_e5_features(features_path, pairs_path, norm_dir, output_path, mode='tr
     gc.collect()
     print(f"  Pass 1 done in {time.time()-t1:.1f}s")
     
-    # ── Pass 2: Address cosine (~22 GB) ──────────────────────────
-    print(f"\n  Pass 2/2: Loading address embeddings into RAM...")
+    # ── Pass 2: Address cosine (~22 GB on disk, 0 GB in RAM) ─────────
+    print(f"\n  Pass 2/2: Memory-mapping address embeddings...")
     t2 = time.time()
-    s1_addr_emb = np.load(cache_paths['s1_addr'])
-    cand_addr_emb = np.load(cache_paths['cand_addr'])
-    print(f"  Loaded in {time.time()-t2:.1f}s  "
+    s1_addr_emb = np.load(cache_paths['s1_addr'], mmap_mode='r')
+    cand_addr_emb = np.load(cache_paths['cand_addr'], mmap_mode='r')
+    print(f"  Mapped in {time.time()-t2:.1f}s  "
           f"({s1_addr_emb.nbytes/1e9:.1f} + {cand_addr_emb.nbytes/1e9:.1f} = "
-          f"{(s1_addr_emb.nbytes + cand_addr_emb.nbytes)/1e9:.1f} GB)")
+          f"{(s1_addr_emb.nbytes + cand_addr_emb.nbytes)/1e9:.1f} GB virtual)")
     
     total_pairs = _cosine_pass(
         temp_path, output_path,
