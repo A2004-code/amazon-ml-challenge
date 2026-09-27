@@ -217,7 +217,24 @@ def compute_e5_embeddings(pairs_path, norm_dir, mode='train'):
     # Load E5 model
     print(f"\n  Loading E5 model: {config.E5_MODEL_NAME}")
     t0 = time.time()
-    model = SentenceTransformer(config.E5_MODEL_NAME)
+    
+    def load_safely(model_name):
+        from sentence_transformers import SentenceTransformer
+        import json, shutil, os
+        try:
+            return SentenceTransformer(model_name)
+        except (json.decoder.JSONDecodeError, OSError) as e:
+            print(f"\n  WARNING: HuggingFace cache corruption detected: {e}")
+            hf_home = os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            model_dir_name = "models--" + model_name.replace("/", "--")
+            cache_path = Path(hf_home) / "hub" / model_dir_name
+            if cache_path.exists():
+                print(f"  Deleting corrupted cache at {cache_path}...")
+                shutil.rmtree(cache_path, ignore_errors=True)
+            print("  Retrying model download...")
+            return SentenceTransformer(model_name)
+            
+    model = load_safely(config.E5_MODEL_NAME)
     print(f"  Model loaded in {time.time()-t0:.1f}s")
     
     # Encode S1 names -> Save -> Clear RAM
