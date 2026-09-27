@@ -90,9 +90,6 @@ def generate_labels(features_path, gt_path):
             axis=1
         ).astype(np.int8)
         
-        # We don't need cand_entity_id anymore for training, drop to save memory
-        chunk.drop(columns=['cand_entity_id'], inplace=True)
-        
         chunk_list.append(chunk)
         total_rows += len(chunk)
         print(f"    Loaded {total_rows:,} rows... ({(time.time()-t0)/60:.1f} min)")
