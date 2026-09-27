@@ -248,31 +248,36 @@ def train_lightgbm(train_df, val_df, feature_cols):
 
 def per_entity_f05(val_df, y_pred, beta=0.5):
     """Macro-average F_beta computed per S1 entity, matching the challenge metric exactly."""
-    val = val_df.copy()
-    val['pred'] = y_pred
-
-    scores = []
-    for s1_id, group in val.groupby('s1_entity_id'):
-        true_pos_ids = set(group.loc[group['label'] == 1, 'cand_entity_id'])
-        pred_pos_ids = set(group.loc[group['pred'] == 1, 'cand_entity_id'])
-
-        if not true_pos_ids and not pred_pos_ids:
-            scores.append(1.0)   # correct singleton
-            continue
-        if not pred_pos_ids:
-            scores.append(0.0)   # missed everything
-            continue
-
-        tp = len(true_pos_ids & pred_pos_ids)
-        precision = tp / len(pred_pos_ids)
-        recall = tp / len(true_pos_ids) if true_pos_ids else 0.0
-        if precision == 0 and recall == 0:
-            scores.append(0.0)
-            continue
-        f = (1 + beta**2) * precision * recall / (beta**2 * precision + recall) if (precision or recall) else 0.0
-        scores.append(f)
-
-    return sum(scores) / len(scores) if scores else 0.0
+    val = pd.DataFrame({
+        's1_entity_id': val_df['s1_entity_id'],
+        'label': val_df['label'],
+        'pred': y_pred
+    })
+    
+    # Calculate TP, predicted positives, and true positives per group
+    tp = ((val['label'] == 1) & (val['pred'] == 1)).groupby(val['s1_entity_id']).sum()
+    pred_pos = (val['pred'] == 1).groupby(val['s1_entity_id']).sum()
+    true_pos = (val['label'] == 1).groupby(val['s1_entity_id']).sum()
+    
+    precision = tp / pred_pos
+    recall = tp / true_pos
+    
+    # Default to 0
+    precision = precision.fillna(0.0)
+    recall = recall.fillna(0.0)
+    
+    # Calculate F-beta
+    f_num = (1 + beta**2) * precision * recall
+    f_den = (beta**2 * precision) + recall
+    f_score = f_num / f_den
+    f_score = f_score.fillna(0.0)
+    
+    # Special cases from the original logic:
+    # If no true positives and no predicted positives -> perfect score (1.0)
+    perfect_mask = (true_pos == 0) & (pred_pos == 0)
+    f_score[perfect_mask] = 1.0
+    
+    return f_score.mean()
 
 
 def tune_threshold(model, val_df, feature_cols, beta=0.5):
